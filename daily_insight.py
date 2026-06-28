@@ -12,10 +12,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import anthropic
 import feedparser
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import truststore
 
-load_dotenv()
+load_dotenv(dotenv_path=r"C:\projects\daily-insight\.env")
 truststore.inject_into_ssl()
 
 # ============================================================
@@ -100,10 +102,60 @@ MIYAGAWA_PROFILE = """
 """
 
 
+def load_cookies(cookie_file: str) -> dict:
+    """Cookie-EditorのJSON形式をrequests用辞書に変換"""
+    cookie_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "cookies", cookie_file
+    )
+    if not os.path.exists(cookie_path):
+        return {}
+    with open(cookie_path, "r", encoding="utf-8") as f:
+        cookies_list = json.load(f)
+    return {c["name"]: c["value"] for c in cookies_list if "name" in c and "value" in c}
+
+
+def fetch_ft_article_body(url: str, cookies: dict) -> str:
+    """FT記事の本文を取得（最大2000文字）"""
+    if not cookies:
+        return ""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "ja,en;q=0.9",
+        }
+        resp = requests.get(url, cookies=cookies, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"   FT取得失敗（{resp.status_code}）：{url}")
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # FTの本文は <div class="article-body"> または <div data-component="article-body">
+        body_div = (
+            soup.find("div", class_="article-body")
+            or soup.find("div", attrs={"data-component": "article-body"})
+            or soup.find("div", class_="n-content-body")
+        )
+        if not body_div:
+            return ""
+        # 段落テキストを結合
+        paragraphs = body_div.find_all("p")
+        text = "\n".join(p.get_text(strip=True) for p in paragraphs)
+        return text[:2000]
+    except Exception as e:
+        print(f"   FT本文取得エラー：{e}")
+        return ""
+
+
 def fetch_rss_articles(max_per_domain: int = 3) -> list[dict]:
     """RSSフィードから最新記事を収集"""
     articles = []
     today = datetime.date.today()
+
+    # FT Cookieを事前ロード
+    ft_cookies = load_cookies("ft_cookies.json")
+    if ft_cookies:
+        print("   ✅ FT Cookieロード済み（本文取得モード）")
+    else:
+        print("   ⚠️  FT Cookie未設定（タイトル・概要のみ）")
 
     for domain, feeds in RSS_FEEDS.items():
         domain_articles = []
@@ -117,18 +169,34 @@ def fetch_rss_articles(max_per_domain: int = 3) -> list[dict]:
                         pub_date = datetime.date(*published[:3])
                         if (today - pub_date).days > 7:
                             continue
+
+                    link = entry.get("link", "")
+                    summary = entry.get("summary", "")[:300]
+
+                    # FT記事の場合は本文取得を試みる
+                    full_body = ""
+                    if ft_cookies and "ft.com" in link:
+                        print(f"   📖 FT本文取得中：{entry.get('title', '')[:40]}...")
+                        full_body = fetch_ft_article_body(link, ft_cookies)
+
                     domain_articles.append({
                         "domain": domain,
                         "title": entry.get("title", ""),
-                        "summary": entry.get("summary", "")[:300],
-                        "link": entry.get("link", ""),
+                        "summary": summary,
+                        "full_body": full_body,  # FTのみ本文あり、他は空文字
+                        "link": link,
                         "published": str(published[:3]) if published else "不明",
+                        "has_full_body": bool(full_body),
                     })
                     if len(domain_articles) >= max_per_domain:
                         break
             except Exception as e:
                 print(f"RSS取得エラー ({feed_url}): {e}")
         articles.extend(domain_articles[:max_per_domain])
+
+    ft_full = sum(1 for a in articles if a.get("has_full_body"))
+    if ft_full:
+        print(f"   📰 FT本文取得成功：{ft_full}件")
 
     return articles
 
@@ -152,7 +220,9 @@ def select_topic_and_generate_question(articles: list[dict], manual_topic: str =
             domain_articles = articles[:5]  # フォールバック
 
         articles_text = "\n".join([
-            f"・{a['title']}\n  概要：{a['summary']}\n  URL：{a['link']}"
+            f"・{a['title']}\n"
+            f"  {'【本文】' + a['full_body'][:800] if a.get('has_full_body') else '概要：' + a['summary']}\n"
+            f"  URL：{a['link']}"
             for a in domain_articles[:5]
         ])
 
